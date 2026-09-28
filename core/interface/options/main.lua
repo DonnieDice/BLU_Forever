@@ -9,7 +9,9 @@ local BLU = _G["BLU"]
 local Tabs = BLU.Modules and BLU.Modules["tabs"]
 
 -- Layout Constants
-local TAB_BUTTON_WIDTH_CORE = 94
+-- Width of the vertical divider between the settings block and the event
+-- pages; must match the tabs module's DIVIDER_WIDTH (operator note 10638).
+local DIVIDER_WIDTH = 2
 
 -- Create options module
 local Options = {}
@@ -159,6 +161,9 @@ function Options:CreateOptionsPanel()
     local tabContainer = CreateFrame("Frame", nil, container)
     tabContainer:SetPoint("TOPLEFT", header, "BOTTOMLEFT", 0, -2)
     tabContainer:SetPoint("TOPRIGHT", header, "BOTTOMRIGHT", 0, -2)
+    if Tabs and Tabs.SetContainer then
+        Tabs:SetContainer(tabContainer)
+    end
     local tabContainerHeight = (Tabs and Tabs.GetContainerHeight and Tabs:GetContainerHeight()) or 62
     tabContainer:SetHeight(tabContainerHeight)
 
@@ -174,9 +179,36 @@ function Options:CreateOptionsPanel()
     leftTabGroup:SetBackdropBorderColor(0.15, 0.25, 0.35, 1)
 
     local leftSeparator = tabContainer:CreateTexture(nil, "OVERLAY")
-    leftSeparator:SetSize(2, tabContainerHeight - 12)
-    leftSeparator:SetPoint("TOPLEFT", leftTabGroup, "TOPRIGHT", 5, -2)
+    leftSeparator:SetSize(DIVIDER_WIDTH, tabContainerHeight - 12)
+    -- Operator note 10638: the divider moves right of the settings block
+    -- (columns 1-2) so it separates the settings tabs from the event pages.
+    -- Tabs:GetDividerOffset() is the strip-derived x (settings sub-strip end
+    -- + 5px); fall back to the legacy fixed 100px-group divider position if
+    -- the tabs module predates the API.
+    local dividerX = (Tabs and Tabs.GetDividerOffset and Tabs:GetDividerOffset()) or 110
+    leftSeparator:SetPoint("TOPLEFT", tabContainer, "TOPLEFT", dividerX, -2)
     leftSeparator:SetColorTexture(0.12, 0.16, 0.22, 0.85)
+
+    -- Dynamic reflow: whenever the tab strip's width changes (UI scale,
+    -- panel resize), re-wrap the buttons and resize the container and its
+    -- fixed-height decorations so leftTabGroup/leftSeparator track the
+    -- wrapped row count.
+    local function RefreshTabStripLayout()
+        if not (Tabs and Tabs.RefreshLayout) then return end
+        local rows = Tabs:RefreshLayout()
+        if rows and Tabs.GetContainerHeight then
+            local newHeight = Tabs:GetContainerHeight()
+            if newHeight ~= tabContainerHeight then
+                tabContainerHeight = newHeight
+                tabContainer:SetHeight(newHeight)
+                leftTabGroup:SetSize(100, newHeight - 8)
+                leftSeparator:SetSize(2, newHeight - 12)
+            end
+        end
+    end
+    tabContainer:HookScript("OnSizeChanged", function()
+        RefreshTabStripLayout()
+    end)
 
     panel.tabs = {}
     panel.contents = {}
@@ -196,6 +228,10 @@ function Options:CreateOptionsPanel()
     for i, tabInfo in ipairs(tabs) do
         BLU:PrintDebug("[Options] Creating tab content for '" .. tostring(tabInfo.text) .. "'")
         local tab = BLU.CreateTabButton(tabContainer, tabInfo.text, i, tabInfo.row, tabInfo.col, panel, tabInfo.icon)
+        if Tabs then
+            Tabs.buttons = Tabs.buttons or {}
+            Tabs.buttons[i] = tab
+        end
         if tabInfo.placeholder then
             tab:SetPlaceholder(true)
         end
@@ -238,6 +274,11 @@ function Options:CreateOptionsPanel()
         end
         panel.contents[i] = content
     end
+
+    -- All buttons exist now: run the initial dynamic wrap pass so the strip
+    -- reflects the live spec at the container's actual width (this also
+    -- corrects the container height before the panel is first shown).
+    RefreshTabStripLayout()
 
     -- Destroy all child frames/regions on a content panel so a clean rebuild won't stack widgets.
     local function ClearTabContent(content)

@@ -19,9 +19,156 @@ local TAB_ROW_PADDING = 8
 local TAB_ROW_SPACING = 3
 local TAB_COLUMNS_PER_ROW = 6
 
+-- Settings block geometry (operator note 10638): tabs with group = "settings"
+-- form a width-independent two-column sub-strip left of the divider; every
+-- other tab is an event page flowing right of the divider.
+local TAB_CORE_GUTTER = 16
+local SETTINGS_STRIP_WIDTH = TAB_ROW_PADDING + TAB_BUTTON_WIDTH_CORE + TAB_CORE_GUTTER + TAB_BUTTON_WIDTH_WIDE
+local DIVIDER_WIDTH = 2
+local DIVIDER_OFFSET = SETTINGS_STRIP_WIDTH + 5
+local EVENT_STRIP_ORIGIN = DIVIDER_OFFSET + DIVIDER_WIDTH + 5
+
 local function GetTabRowWidth()
     -- 1 core column + 5 wide columns + spacing + 16px gutter
     return TAB_BUTTON_WIDTH_CORE + (5 * TAB_BUTTON_WIDTH_WIDE) + (5 * TAB_SPACING) + 16
+end
+
+-- Dynamic tab strip layout ---------------------------------------------------
+-- The strip derives its geometry from the live spec table and the container's
+-- actual width instead of the legacy fixed col-based xOffset math. Buttons are
+-- laid out left-to-right at fixed widths/spacing and wrap onto a new row
+-- (aligned to the same left edge) when the next button would not fit at the
+-- container's current width. The legacy per-tab `row`/`col` spec fields are
+-- kept for compatibility but are hints only; positions come from this
+-- layout pass.
+--
+-- Layout model (matches the legacy single-row rendering when everything fits
+-- on one row):
+--   * first button of the strip: x = TAB_ROW_PADDING, width = CORE (94)
+--   * every other button:        x = prev right edge + TAB_SPACING (6),
+--                                width = WIDE (100)
+--   * every button:             y = -6 - (row-1) * (22 + 3)
+--
+-- The legacy per-button math in UpdatePosition was:
+--   col 1: x = 8,  width 94
+--   col>1: x = 8 + 94 + 16 + (col-2)*(100+6) = 118 + (col-2)*106, width 100
+-- so buttons sit at x = 8, 118, 224, 330, ... The gap after the CORE button
+-- is a 16px gutter; every later WIDE button is 6px after the previous one.
+-- The dynamic pass reproduces exactly this sequence and wraps to the next
+-- row (same left edge and spacing) when the next button would not fit at
+-- the container's current width.
+--
+-- Settings block (operator note 10638): spec entries with group = "settings"
+-- are anchored as their own sub-strip so the grouping is width-independent.
+-- The settings sub-strip flows within a fixed two-column width (94 + 16
+-- gutter + 100 + 8 padding = 218), so the settings tabs always render as a
+-- stacked two-column block (General/Profiles in the boxed CORE column,
+-- Sounds/Debug in column 2) regardless of the container's width. Event pages
+-- flow right of the divider at EVENT_STRIP_ORIGIN and wrap by the
+-- container's actual width. With no settings entries in the spec, the whole
+-- strip degrades to the single-flow layout above (first button CORE at the
+-- left padding), preserving the legacy single-row rendering exactly.
+
+-- Flow one group's buttons inside a horizontal region.
+--   origin:   x of the region's left edge (row start)
+--   regionW:  wrap width for this region (container width for the strip)
+--   firstCore: true when this region's first button is the strip's CORE
+--              button (legacy col-1 width 94); false keeps WIDE (100)
+--   rowStartCore: width a button gets when it wraps to start a new row
+-- Returns the per-button entries for this region and its row count.
+local function FlowButtonGroup(entries, origin, regionW, firstCore, rowStartCore)
+    local buttons = {}
+    local row = 1
+    local prevRight = nil
+    local prevWidth = nil
+
+    for _, entry in ipairs(entries) do
+        local width
+        local x
+        if prevRight == nil then
+            -- first button in this region
+            x = origin
+            width = firstCore and TAB_BUTTON_WIDTH_CORE or TAB_BUTTON_WIDTH_WIDE
+        else
+            -- gap after a CORE button is the legacy 16px gutter,
+            -- gap after a WIDE button is the normal 6px spacing
+            local gap = (prevWidth == TAB_BUTTON_WIDTH_CORE) and TAB_CORE_GUTTER or TAB_SPACING
+            x = prevRight + gap
+            width = TAB_BUTTON_WIDTH_WIDE
+            -- Wrap: does this WIDE button fit inside the region?
+            if x + width > regionW then
+                row = row + 1
+                x = origin
+                width = rowStartCore and TAB_BUTTON_WIDTH_CORE or TAB_BUTTON_WIDTH_WIDE
+            end
+        end
+        local y = -6 - (row - 1) * (TAB_BUTTON_HEIGHT + TAB_ROW_SPACING)
+        buttons[#buttons + 1] = {
+            index = entry.index,
+            x = x,
+            y = y,
+            width = width,
+            row = row,
+        }
+        prevRight = x + width
+        prevWidth = width
+    end
+
+    return buttons, row
+end
+
+-- Compute the dynamic layout for the live spec at a given container width.
+-- Returns a table: { buttons = {{index, x, y, width, row}, ...}, rows = N }
+-- Buttons hidden by the flavors hook (hidden = true) are skipped.
+local function ComputeTabLayout(containerWidth)
+    local layout = { buttons = {}, rows = 1 }
+    if not BLU.OptionsTabs or containerWidth == nil or containerWidth <= 0 then
+        return layout
+    end
+
+    local settingsEntries = {}
+    local eventEntries = {}
+    for index, tabInfo in ipairs(BLU.OptionsTabs) do
+        if not tabInfo.hidden then
+            local entry = { index = index }
+            if tabInfo.group == "settings" then
+                settingsEntries[#settingsEntries + 1] = entry
+            else
+                eventEntries[#eventEntries + 1] = entry
+            end
+        end
+    end
+
+    local rows = 1
+    if #settingsEntries > 0 then
+        -- Settings sub-strip: fixed two-column flow region, width-independent
+        -- of the container (clamped to the container so a pathologically
+        -- narrow panel cannot push settings buttons off-strip).
+        local settingsW = math.min(SETTINGS_STRIP_WIDTH, containerWidth)
+        local buttons, usedRows = FlowButtonGroup(settingsEntries, TAB_ROW_PADDING, settingsW, true, true)
+        for _, b in ipairs(buttons) do
+            layout.buttons[#layout.buttons + 1] = b
+        end
+        if usedRows > rows then rows = usedRows end
+
+        -- Event pages: flow right of the divider, wrapped by the container.
+        local eventButtons, eventRows = FlowButtonGroup(eventEntries, EVENT_STRIP_ORIGIN, containerWidth, false, false)
+        for _, b in ipairs(eventButtons) do
+            layout.buttons[#layout.buttons + 1] = b
+        end
+        if eventRows > rows then rows = eventRows end
+    else
+        -- No settings block: single-flow strip, first button CORE at the
+        -- left padding (identical to the pre-grouping dynamic layout).
+        local buttons, usedRows = FlowButtonGroup(eventEntries, TAB_ROW_PADDING, containerWidth, true, true)
+        for _, b in ipairs(buttons) do
+            layout.buttons[#layout.buttons + 1] = b
+        end
+        rows = usedRows
+    end
+
+    layout.rows = rows
+    return layout
 end
 
 -- Generic "coming soon" placeholder panel — used by Combat, Collectibles, Loot, and Prey
@@ -598,10 +745,20 @@ local function CreateCombatPrototypePanel(panel)
 end
 
 function Tabs:GetRowCount()
+    -- Dynamic layout: row count comes from the wrapped layout for the live
+    -- spec at the tab container's current width. Falls back to the legacy
+    -- spec `row` hints when no container has been wired yet (so callers that
+    -- run before CreateOptionsPanel still get a sane height).
+    if self.container and self.container.GetWidth then
+        local ok, width = pcall(self.container.GetWidth, self.container)
+        if ok and type(width) == "number" and width > 0 then
+            return ComputeTabLayout(width).rows
+        end
+    end
     local maxRow = 1
     if BLU.OptionsTabs then
         for _, tabInfo in ipairs(BLU.OptionsTabs) do
-            if tabInfo.row and tabInfo.row > maxRow then
+            if tabInfo.row and tabInfo.row > maxRow and not tabInfo.hidden then
                 maxRow = tabInfo.row
             end
         end
@@ -613,31 +770,91 @@ function Tabs:GetContainerHeight()
     return 6 + (self:GetRowCount() * TAB_BUTTON_HEIGHT) + ((self:GetRowCount() - 1) * TAB_ROW_SPACING) + 6
 end
 
+-- Wire the strip's container frame. Called by CreateOptionsPanel after the
+-- tabContainer exists; GetRowCount then reflects the wrapped layout at the
+-- container's live width.
+function Tabs:SetContainer(container)
+    self.container = container
+end
+
+-- x offset (from the tab container's TOPLEFT) of the vertical divider that
+-- separates the settings block (columns 1-2) from the event pages. Used by
+-- CreateOptionsPanel to place leftSeparator; the settings sub-strip ends at
+-- SETTINGS_STRIP_WIDTH and the divider sits 5px right of it.
+function Tabs:GetDividerOffset()
+    return DIVIDER_OFFSET
+end
+
+-- Recompute the dynamic layout for the live spec at the container's current
+-- width and apply it to every tab button. Idempotent; safe to call on every
+-- OnSizeChanged and after any spec change (tab add/remove). Buttons whose
+-- spec entry is hidden are hidden; all others are shown and repositioned.
+-- Returns the computed row count.
+function Tabs:RefreshLayout()
+    if not self.container then return nil end
+    local width = self.container:GetWidth()
+    if not width or width <= 0 then return nil end
+
+    local layout = ComputeTabLayout(width)
+    local applied = {}
+    for _, entry in ipairs(layout.buttons) do
+        local button = self.buttons and self.buttons[entry.index]
+        if button then
+            button.tabX = entry.x
+            button.tabLayoutRow = entry.row
+            button.tabWidth = entry.width
+            button:UpdatePosition()
+            button:Show()
+            applied[entry.index] = true
+        end
+    end
+    -- Buttons whose spec entry is hidden (flavor-gated out) stay hidden.
+    if self.buttons then
+        for index, button in ipairs(self.buttons) do
+            if not applied[index] then
+                button:Hide()
+            end
+        end
+    end
+    self.layoutRows = layout.rows
+    return layout.rows
+end
+
 -- Create a tab button (alpha.3 style)
 function BLU.CreateTabButton(parent, text, index, row, col, panel, icon)
     local buttonName = "BLUTab" .. tostring(index) .. text:gsub("%W", "")
     local button = CreateFrame("Button", buttonName, parent)
     button:SetSize(TAB_BUTTON_WIDTH_CORE, TAB_BUTTON_HEIGHT)
+    -- Legacy spec hints, kept for compatibility; the dynamic layout pass
+    -- (Tabs:RefreshLayout) owns the actual geometry.
     button.tabRow = row
     button.tabCol = col
     button.isPlaceholder = false
-    button:SetSize(TAB_BUTTON_WIDTH_CORE, TAB_BUTTON_HEIGHT)
+
+    -- Dynamic position/width for this button, computed from the live spec
+    -- and the container's actual width by ComputeTabLayout. Until the first
+    -- strip-level layout pass runs (Tabs:RefreshLayout), fall back to the
+    -- legacy fixed row/col math so the button renders exactly where the old
+    -- code put it; once the dynamic pass has run, tabX/tabLayoutRow/tabWidth
+    -- own the geometry.
+    local function legacyPosition(self)
+        if self.tabCol == 1 then
+            return TAB_ROW_PADDING, TAB_BUTTON_WIDTH_CORE
+        end
+        return TAB_ROW_PADDING + TAB_BUTTON_WIDTH_CORE + 16 + (self.tabCol - 2) * (TAB_BUTTON_WIDTH_WIDE + TAB_SPACING),
+            TAB_BUTTON_WIDTH_WIDE
+    end
 
     function button:UpdatePosition()
-        local startX = TAB_ROW_PADDING
-        local xOffset = startX
-        local width = TAB_BUTTON_WIDTH_CORE
-
-        if self.tabCol == 1 then
-            xOffset = startX
-            width = TAB_BUTTON_WIDTH_CORE
+        local xOffset, width
+        if self.tabX ~= nil then
+            xOffset, width = self.tabX, (self.tabWidth or TAB_BUTTON_WIDTH_CORE)
         else
-            xOffset = startX + TAB_BUTTON_WIDTH_CORE + 16 + (self.tabCol - 2) * (TAB_BUTTON_WIDTH_WIDE + TAB_SPACING)
-            width = TAB_BUTTON_WIDTH_WIDE
+            xOffset, width = legacyPosition(self)
         end
-
+        local layoutRow = self.tabLayoutRow or self.tabRow or 1
+        local yOffset = -6 - (layoutRow - 1) * (TAB_BUTTON_HEIGHT + TAB_ROW_SPACING)
         self:SetWidth(width)
-        local yOffset = -6 - (self.tabRow - 1) * (TAB_BUTTON_HEIGHT + TAB_ROW_SPACING)
         self:ClearAllPoints()
         self:SetPoint("TOPLEFT", parent, "TOPLEFT", xOffset, yOffset)
     end
@@ -646,9 +863,8 @@ function BLU.CreateTabButton(parent, text, index, row, col, panel, icon)
     button:HookScript("OnShow", function(self)
         self:UpdatePosition()
     end)
-    parent:HookScript("OnSizeChanged", function()
-        button:UpdatePosition()
-    end)
+    -- Container width changes re-wrap the whole strip; the strip-level
+    -- RefreshLayout hook below triggers this button's reposition too.
 
     local bg = button:CreateTexture(nil, "BACKGROUND")
     bg:SetAllPoints()
@@ -771,23 +987,26 @@ function Tabs:Init()
 
     BLU.OptionsTabs = {
         -- Forever build: only the tabs this client can fire, and no
-        -- placeholder/sentinel rows. Core column first, two feature columns.
-        -- Row 1
-        {text = "General",     create = BLU.CreateGeneralPanel,  row = 1, col = 1, icon = "Interface\\Icons\\INV_Misc_Gear_08"},
-        {text = "Level Up",    eventType = "levelup",            row = 1, col = 2, feature = "levelup",     icon = "Interface\\Icons\\Achievement_Level_100"},
-        {text = "Combat",      create = combatPanel,             row = 1, col = 3, feature = "combat",      icon = "Interface\\Icons\\Ability_Warrior_Charge"},
-        -- Row 2
-        {text = "Debug",       create = BLU.CreateDebugPanel,    row = 2, col = 1, icon = "Interface\\Icons\\INV_Misc_Gear_03"},
-        {text = "Quest",       eventType = "quest",              row = 2, col = 2, feature = "quest",       icon = "Interface\\Icons\\INV_Misc_Note_01"},
-        {text = "Collectibles",create = collectiblesPanel,       row = 2, col = 3, feature = "collectibles",icon = "Interface\\Icons\\INV_Misc_Toy_07"},
-        -- Row 3
-        {text = "Profiles",    create = BLU.CreateProfilesPanel, row = 3, col = 1, icon = "Interface\\Icons\\Ability_Marksmanship"},
-        {text = "Reputation",  eventType = "reputation",         row = 3, col = 2, feature = "reputation",  icon = "Interface\\Icons\\Achievement_Reputation_01"},
-        {text = "Loot",        create = lootPanel,               row = 3, col = 3, feature = "loot",        icon = "Interface\\Icons\\INV_Misc_Coin_02"},
-        -- Row 4
-        {text = "Sounds",      create = BLU.CreateSoundsPanel,   row = 4, col = 1, icon = "Interface\\Icons\\INV_Misc_Bell_01"},
-        {text = "Honor",       eventType = "honorrank",          row = 4, col = 2, feature = "honorrank",   icon = "Interface\\Icons\\PVPCurrency-Honor-Horde"},
-        {text = "Hardcore",    create = BLU.CreateHardcorePanel, row = 4, col = 3, feature = "hardcore",    icon = "Interface\\Icons\\INV_Misc_Bone_HumanSkull"},
+        -- placeholder/sentinel rows. Settings tabs (group = "settings")
+        -- anchor left of the divider as a width-independent two-column
+        -- block: General/Profiles in the boxed CORE column, Sounds/Debug in
+        -- column 2. Event pages flow right of the divider (operator note
+        -- 10638). The row/col fields are legacy hints for the pre-layout
+        -- fallback only; the dynamic layout pass owns the real geometry.
+        -- Settings block: rows 1-2, columns 1-2
+        {text = "General",     create = BLU.CreateGeneralPanel,  row = 1, col = 1, group = "settings", icon = "Interface\\Icons\\INV_Misc_Gear_08"},
+        {text = "Sounds",      create = BLU.CreateSoundsPanel,   row = 1, col = 2, group = "settings", icon = "Interface\\Icons\\INV_Misc_Bell_01"},
+        {text = "Profiles",    create = BLU.CreateProfilesPanel, row = 2, col = 1, group = "settings", icon = "Interface\\Icons\\Ability_Marksmanship"},
+        {text = "Debug",       create = BLU.CreateDebugPanel,    row = 2, col = 2, group = "settings", icon = "Interface\\Icons\\INV_Misc_Gear_03"},
+        -- Event pages: rows 1-2, columns 3-6
+        {text = "Level Up",     eventType = "levelup",           row = 1, col = 3, feature = "levelup",     icon = "Interface\\Icons\\Achievement_Level_100"},
+        {text = "Quest",        eventType = "quest",              row = 1, col = 4, feature = "quest",       icon = "Interface\\Icons\\INV_Misc_Note_01"},
+        {text = "Reputation",   eventType = "reputation",         row = 1, col = 5, feature = "reputation",  icon = "Interface\\Icons\\Achievement_Reputation_01"},
+        {text = "Honor",        eventType = "honorrank",          row = 1, col = 6, feature = "honorrank",   icon = "Interface\\Icons\\PVPCurrency-Honor-Horde"},
+        {text = "Combat",       create = combatPanel,             row = 2, col = 3, feature = "combat",      icon = "Interface\\Icons\\Ability_Warrior_Charge"},
+        {text = "Collectibles", create = collectiblesPanel,       row = 2, col = 4, feature = "collectibles",icon = "Interface\\Icons\\INV_Misc_Toy_07"},
+        {text = "Loot",         create = lootPanel,               row = 2, col = 5, feature = "loot",        icon = "Interface\\Icons\\INV_Misc_Coin_02"},
+        {text = "Hardcore",     create = BLU.CreateHardcorePanel, row = 2, col = 6, feature = "hardcore",    icon = "Interface\\Icons\\Spell_Shadow_AnimateDead"},
     }
 
     if BLU.Modules.flavors and BLU.Modules.flavors.ApplyToTabSpec then
